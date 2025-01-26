@@ -1,16 +1,35 @@
 import { SETTINGS_KEY } from '@/constants';
-import { HTTP } from '@/vendor/open-api';
+import { HTTP, ENV } from '@/vendor/open-api';
+import { hex_md5 } from '@/vendor/md5';
+import { getPolicyDescriptor } from '@/utils';
 import $ from '@/core/app';
 import headersResourceCache from '@/utils/headers-resource-cache';
 
 export function getFlowField(headers) {
-    const subkey = Object.keys(headers).filter((k) =>
-        /SUBSCRIPTION-USERINFO/i.test(k),
-    )[0];
-    return headers[subkey];
+    const keys = Object.keys(headers);
+    let sub = '';
+    let webPage = '';
+    for (let k of keys) {
+        const lower = k.toLowerCase();
+        if (lower === 'subscription-userinfo') {
+            sub = headers[k];
+        } else if (lower === 'profile-web-page-url') {
+            webPage = headers[k];
+        }
+    }
+
+    return `${sub || ''}${
+        webPage ? `; app_url=${encodeURIComponent(webPage)}` : ''
+    }`;
 }
-export async function getFlowHeaders(rawUrl, ua, timeout) {
-    let url = rawUrl;
+export async function getFlowHeaders(
+    rawUrl,
+    ua,
+    timeout,
+    customProxy,
+    flowUrl,
+) {
+    let url = flowUrl || rawUrl || '';
     let $arguments = {};
     const rawArgs = url.split('#');
     url = url.split('#')[0];
@@ -33,53 +52,126 @@ export async function getFlowHeaders(rawUrl, ua, timeout) {
     if ($arguments?.noFlow) {
         return;
     }
-    const cached = headersResourceCache.get(url);
+    const { isStash, isLoon, isShadowRocket, isQX } = ENV();
+    const insecure = $arguments?.insecure
+        ? $.env.isNode
+            ? { strictSSL: false }
+            : { insecure: true }
+        : undefined;
+    const { defaultProxy, defaultFlowUserAgent, defaultTimeout } =
+        $.read(SETTINGS_KEY);
+    let proxy = customProxy || defaultProxy;
+    if ($.env.isNode) {
+        proxy = proxy || eval('process.env.SUB_STORE_BACKEND_DEFAULT_PROXY');
+    }
+    const userAgent = ua || defaultFlowUserAgent || 'clash';
+    const requestTimeout = timeout || defaultTimeout || 8000;
+    const id = hex_md5(userAgent + url);
+    const cached = headersResourceCache.get(id);
     let flowInfo;
     if (!$arguments?.noCache && cached) {
-        // $.info(`使用缓存的流量信息: ${url}`);
+        $.info(`使用缓存的流量信息: ${url}, ${userAgent}`);
         flowInfo = cached;
     } else {
-        const { defaultFlowUserAgent, defaultTimeout } = $.read(SETTINGS_KEY);
-        const userAgent =
-            ua ||
-            defaultFlowUserAgent ||
-            'Quantumult%20X/1.0.30 (iPhone14,2; iOS 15.6)';
-        const requestTimeout = timeout || defaultTimeout;
         const http = HTTP();
-        try {
-            // $.info(`使用 HEAD 方法获取流量信息: ${url}`);
-            const { headers } = await http.head({
-                url: url
-                    .split(/[\r\n]+/)
-                    .map((i) => i.trim())
-                    .filter((i) => i.length)[0],
-                headers: {
-                    'User-Agent': userAgent,
-                },
-                timeout: requestTimeout,
-            });
-            flowInfo = getFlowField(headers);
-        } catch (e) {
-            $.error(
-                `使用 HEAD 方法获取流量信息失败: ${url}: ${e.message ?? e}`,
+        if (flowUrl) {
+            $.info(
+                `使用 GET 方法从响应体获取流量信息: ${flowUrl}, User-Agent: ${
+                    userAgent || ''
+                }, Insecure: ${!!insecure}, Proxy: ${proxy}`,
             );
-        }
-        if (!flowInfo) {
-            $.info(`使用 GET 方法获取流量信息: ${url}`);
-            const { headers } = await http.get({
-                url: url
-                    .split(/[\r\n]+/)
-                    .map((i) => i.trim())
-                    .filter((i) => i.length)[0],
+            const { body } = await http.get({
+                url: flowUrl,
                 headers: {
                     'User-Agent': userAgent,
                 },
                 timeout: requestTimeout,
+                ...(proxy ? { proxy } : {}),
+                ...(isLoon && proxy ? { node: proxy } : {}),
+                ...(isQX && proxy ? { opts: { policy: proxy } } : {}),
+                ...(proxy ? getPolicyDescriptor(proxy) : {}),
+                ...(insecure ? insecure : {}),
             });
-            flowInfo = getFlowField(headers);
+            flowInfo = body;
+        } else {
+            try {
+                $.info(
+                    `使用 HEAD 方法从响应头获取流量信息: ${url}, User-Agent: ${
+                        userAgent || ''
+                    }, Insecure: ${!!insecure}, Proxy: ${proxy}`,
+                );
+                const { headers } = await http.head({
+                    url: url
+                        .split(/[\r\n]+/)
+                        .map((i) => i.trim())
+                        .filter((i) => i.length)[0],
+                    headers: {
+                        'User-Agent': userAgent,
+                        ...(isStash && proxy
+                            ? {
+                                  'X-Stash-Selected-Proxy':
+                                      encodeURIComponent(proxy),
+                              }
+                            : {}),
+                        ...(isShadowRocket && proxy
+                            ? { 'X-Surge-Policy': proxy }
+                            : {}),
+                    },
+                    timeout: requestTimeout,
+                    ...(proxy ? { proxy } : {}),
+                    ...(isLoon && proxy ? { node: proxy } : {}),
+                    ...(isQX && proxy ? { opts: { policy: proxy } } : {}),
+                    ...(proxy ? getPolicyDescriptor(proxy) : {}),
+                    ...(insecure ? insecure : {}),
+                });
+                flowInfo = getFlowField(headers);
+            } catch (e) {
+                $.error(
+                    `使用 HEAD 方法从响应头获取流量信息失败: ${url}, User-Agent: ${
+                        userAgent || ''
+                    }, Insecure: ${!!insecure}, Proxy: ${proxy}: ${
+                        e.message ?? e
+                    }`,
+                );
+            }
+            if (!flowInfo) {
+                $.info(
+                    `使用 GET 方法获取流量信息: ${url}, User-Agent: ${
+                        userAgent || ''
+                    }, Insecure: ${!!insecure}, Proxy: ${proxy}`,
+                );
+                const { headers } = await http.get({
+                    url: url
+                        .split(/[\r\n]+/)
+                        .map((i) => i.trim())
+                        .filter((i) => i.length)[0],
+                    headers: {
+                        'User-Agent': userAgent,
+                        ...(isStash && proxy
+                            ? {
+                                  'X-Stash-Selected-Proxy':
+                                      encodeURIComponent(proxy),
+                              }
+                            : {}),
+                        ...(isShadowRocket && proxy
+                            ? { 'X-Surge-Policy': proxy }
+                            : {}),
+                    },
+                    timeout: requestTimeout,
+                    ...(proxy ? { proxy } : {}),
+                    ...(isLoon && proxy ? { node: proxy } : {}),
+                    ...(isQX && proxy ? { opts: { policy: proxy } } : {}),
+                    ...(proxy ? getPolicyDescriptor(proxy) : {}),
+                    ...(insecure ? insecure : {}),
+                });
+                flowInfo = getFlowField(headers);
+            }
         }
         if (flowInfo) {
-            headersResourceCache.set(url, flowInfo);
+            flowInfo = flowInfo.trim();
+        }
+        if (flowInfo) {
+            headersResourceCache.set(id, flowInfo);
         }
     }
 
@@ -110,13 +202,114 @@ export function parseFlowHeaders(flowHeaders) {
         ? Number(expireMatch[1] + expireMatch[2])
         : undefined;
 
-    return { expires, total, usage: { upload, download } };
+    const remainingDaysMatch = flowHeaders.match(/reset_day=([0-9]+)/);
+    const remainingDays = remainingDaysMatch
+        ? Number(remainingDaysMatch[1])
+        : undefined;
+
+    const appUrlMatch = flowHeaders.match(/app_url=(.*?)\s*?(;|$)/);
+    const appUrl = appUrlMatch ? decodeURIComponent(appUrlMatch[1]) : undefined;
+
+    const planNameMatch = flowHeaders.match(/plan_name=(.*?)\s*?(;|$)/);
+    const planName = planNameMatch
+        ? decodeURIComponent(planNameMatch[1])
+        : undefined;
+
+    return {
+        expires,
+        total,
+        usage: { upload, download },
+        remainingDays,
+        appUrl,
+        planName,
+    };
 }
+
 export function flowTransfer(flow, unit = 'B') {
-    const unitList = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+    const unitList = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
     let unitIndex = unitList.indexOf(unit);
 
-    return flow < 1024
+    return flow < 1024 || unitIndex === unitList.length - 1
         ? { value: flow.toFixed(1), unit: unit }
         : flowTransfer(flow / 1024, unitList[++unitIndex]);
+}
+
+export function validCheck(flow) {
+    if (!flow) {
+        throw new Error('没有流量信息');
+    }
+    if (flow?.expires && flow.expires * 1000 < Date.now()) {
+        const date = new Date(flow.expires * 1000).toLocaleDateString();
+        throw new Error(`订阅已过期: ${date}`);
+    }
+    if (flow?.total) {
+        const upload = flow.usage?.upload || 0;
+        const download = flow.usage?.download || 0;
+        if (flow.total - upload - download < 0) {
+            const current = upload + download;
+            const currT = flowTransfer(Math.abs(current));
+            currT.value = current < 0 ? '-' + currT.value : currT.value;
+            const totalT = flowTransfer(flow.total);
+            throw new Error(
+                `流量已用完: ${currT.value} ${currT.unit} / ${totalT.value} ${totalT.unit}`,
+            );
+        }
+    }
+}
+
+export function getRmainingDays(opt = {}) {
+    try {
+        let { resetDay, startDate, cycleDays } = opt;
+        if (['string', 'number'].includes(typeof opt)) {
+            resetDay = opt;
+        }
+
+        if (startDate && cycleDays) {
+            cycleDays = parseInt(cycleDays);
+            if (isNaN(cycleDays) || cycleDays <= 0)
+                throw new Error('重置周期应为正整数');
+            if (!startDate || !Date.parse(startDate))
+                throw new Error('开始日期不合法');
+
+            const start = new Date(startDate);
+            const today = new Date();
+            start.setHours(0, 0, 0, 0);
+            today.setHours(0, 0, 0, 0);
+            if (start.getTime() > today.getTime())
+                throw new Error('开始日期应早于现在');
+
+            let resetDate = new Date(startDate);
+            resetDate.setDate(resetDate.getDate() + cycleDays);
+
+            while (resetDate < today) {
+                resetDate.setDate(resetDate.getDate() + cycleDays);
+            }
+
+            resetDate.setHours(0, 0, 0, 0);
+            const timeDiff = resetDate.getTime() - today.getTime();
+            const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
+
+            return daysDiff;
+        } else {
+            if (!resetDay) return;
+            resetDay = parseInt(resetDay);
+            if (isNaN(resetDay) || resetDay <= 0 || resetDay > 31)
+                throw new Error('月重置日应为 1-31 之间的整数');
+            let now = new Date();
+            let today = now.getDate();
+            let month = now.getMonth();
+            let year = now.getFullYear();
+            let daysInMonth;
+
+            if (resetDay > today) {
+                daysInMonth = 0;
+            } else {
+                daysInMonth = new Date(year, month + 1, 0).getDate();
+            }
+
+            return daysInMonth - today + resetDay;
+        }
+    } catch (e) {
+        $.error(`getRmainingDays failed: ${e.message ?? e}`);
+    }
 }

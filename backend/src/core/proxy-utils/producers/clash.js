@@ -108,9 +108,38 @@ export default function Clash_Producer() {
                     }
                 }
                 if (
-                    ['trojan', 'tuic', 'hysteria', 'hysteria2'].includes(
-                        proxy.type,
-                    )
+                    ['vmess', 'vless'].includes(proxy.type) &&
+                    proxy.network === 'h2'
+                ) {
+                    let path = proxy['h2-opts']?.path;
+                    if (
+                        isPresent(proxy, 'h2-opts.path') &&
+                        Array.isArray(path)
+                    ) {
+                        proxy['h2-opts'].path = path[0];
+                    }
+                    let host = proxy['h2-opts']?.headers?.host;
+                    if (
+                        isPresent(proxy, 'h2-opts.headers.Host') &&
+                        !Array.isArray(host)
+                    ) {
+                        proxy['h2-opts'].headers.host = [host];
+                    }
+                }
+                if (proxy['plugin-opts']?.tls) {
+                    if (isPresent(proxy, 'skip-cert-verify')) {
+                        proxy['plugin-opts']['skip-cert-verify'] =
+                            proxy['skip-cert-verify'];
+                    }
+                }
+                if (
+                    [
+                        'trojan',
+                        'tuic',
+                        'hysteria',
+                        'hysteria2',
+                        'juicity',
+                    ].includes(proxy.type)
                 ) {
                     delete proxy.tls;
                 }
@@ -119,13 +148,34 @@ export default function Clash_Producer() {
                     proxy.fingerprint = proxy['tls-fingerprint'];
                 }
                 delete proxy['tls-fingerprint'];
+
+                if (proxy['underlying-proxy']) {
+                    proxy['dialer-proxy'] = proxy['underlying-proxy'];
+                }
+                delete proxy['underlying-proxy'];
+
+                if (isPresent(proxy, 'tls') && typeof proxy.tls !== 'boolean') {
+                    delete proxy.tls;
+                }
+
                 delete proxy.subName;
                 delete proxy.collectionName;
+                delete proxy.id;
+                delete proxy.resolved;
+                delete proxy['no-resolve'];
+                if (type !== 'internal') {
+                    for (const key in proxy) {
+                        if (proxy[key] == null || /^_/i.test(key)) {
+                            delete proxy[key];
+                        }
+                    }
+                }
                 if (
                     ['grpc'].includes(proxy.network) &&
                     proxy[`${proxy.network}-opts`]
                 ) {
                     delete proxy[`${proxy.network}-opts`]['_grpc-type'];
+                    delete proxy[`${proxy.network}-opts`]['_grpc-authority'];
                 }
                 return proxy;
             });
