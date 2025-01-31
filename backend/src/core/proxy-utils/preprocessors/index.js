@@ -1,5 +1,6 @@
-import { safeLoad } from 'static-js-yaml';
+import { safeLoad } from '@/utils/yaml';
 import { Base64 } from 'js-base64';
+import $ from '@/core/app';
 
 function HTML() {
     const name = 'HTML';
@@ -22,6 +23,10 @@ function Base64Encoded() {
         'aHR0c', // htt
         'dmxlc3M=', // vless
         'aHlzdGVyaWEy', // hysteria2
+        'aHkyOi8v', // hy2://
+        'd2lyZWd1YXJkOi8v', // wireguard://
+        'd2c6Ly8=', // wg://
+        'dHVpYzovLw==', // tuic://
     ];
 
     const test = function (raw) {
@@ -31,8 +36,15 @@ function Base64Encoded() {
         );
     };
     const parse = function (raw) {
-        raw = Base64.decode(raw);
-        return raw;
+        const decoded = Base64.decode(raw);
+        if (!/^\w+(:\/\/|\s*?=\s*?)\w+/m.test(decoded)) {
+            $.error(
+                `Base64 Pre-processor error: decoded line does not start with protocol`,
+            );
+            return raw;
+        }
+
+        return decoded;
     };
     return { name, test, parse };
 }
@@ -44,21 +56,48 @@ function Clash() {
         const content = safeLoad(raw);
         return content.proxies && Array.isArray(content.proxies);
     };
-    const parse = function (raw) {
+    const parse = function (raw, includeProxies) {
         // Clash YAML format
+
+        // 防止 VLESS节点 reality-opts 选项中的 short-id 被解析成 Infinity
+        // 匹配 short-id 冒号后面的值(包含空格和引号)
+        const afterReplace = raw.replace(
+            /short-id:([ ]*[^,\n}]*)/g,
+            (matched, value) => {
+                const afterTrim = value.trim();
+
+                // 为空
+                if (!afterTrim || afterTrim === '') {
+                    return 'short-id: ""';
+                }
+
+                // 是否被引号包裹
+                if (/^(['"]).*\1$/.test(afterTrim)) {
+                    return `short-id: ${afterTrim}`;
+                } else {
+                    return `short-id: "${afterTrim}"`;
+                }
+            },
+        );
+
         const {
             proxies,
             'global-client-fingerprint': globalClientFingerprint,
-        } = safeLoad(raw);
-        return proxies
-            .map((p) => {
-                // https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml#L73C1-L73C26
-                if (globalClientFingerprint && !p['client-fingerprint']) {
-                    p['client-fingerprint'] = globalClientFingerprint;
-                }
-                return JSON.stringify(p);
-            })
-            .join('\n');
+        } = safeLoad(afterReplace);
+        return (
+            (includeProxies ? 'proxies:\n' : '') +
+            proxies
+                .map((p) => {
+                    // https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml#L73C1-L73C26
+                    if (globalClientFingerprint && !p['client-fingerprint']) {
+                        p['client-fingerprint'] = globalClientFingerprint;
+                    }
+                    return `${includeProxies ? '  - ' : ''}${JSON.stringify(
+                        p,
+                    )}\n`;
+                })
+                .join('')
+        );
     };
     return { name, test, parse };
 }

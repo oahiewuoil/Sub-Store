@@ -1,21 +1,75 @@
 import { version } from '../../package.json';
-import { SETTINGS_KEY, ARTIFACTS_KEY } from '@/constants';
+import {
+    SETTINGS_KEY,
+    ARTIFACTS_KEY,
+    SUBS_KEY,
+    COLLECTIONS_KEY,
+} from '@/constants';
 import $ from '@/core/app';
 import { produceArtifact } from '@/restful/sync';
 import { syncToGist } from '@/restful/artifacts';
+import { findByName } from '@/utils/database';
 
 !(async function () {
-    const settings = $.read(SETTINGS_KEY);
-    // if GitHub token is not configured
-    if (!settings.githubUser || !settings.gistToken) return;
+    let arg;
+    if (typeof $argument != 'undefined') {
+        arg = Object.fromEntries(
+            // eslint-disable-next-line no-undef
+            $argument.split('&').map((item) => item.split('=')),
+        );
+    } else {
+        arg = {};
+    }
+    let sub_names = (arg?.subscription ?? arg?.sub ?? '')
+        .split(/,|，/g)
+        .map((i) => i.trim())
+        .filter((i) => i.length > 0)
+        .map((i) => decodeURIComponent(i));
+    let col_names = (arg?.collection ?? arg?.col ?? '')
+        .split(/,|，/g)
+        .map((i) => i.trim())
+        .filter((i) => i.length > 0)
+        .map((i) => decodeURIComponent(i));
+    if (sub_names.length > 0 || col_names.length > 0) {
+        if (sub_names.length > 0)
+            await produceArtifacts(sub_names, 'subscription');
+        if (col_names.length > 0)
+            await produceArtifacts(col_names, 'collection');
+    } else {
+        const settings = $.read(SETTINGS_KEY);
+        // if GitHub token is not configured
+        if (!settings.githubUser || !settings.gistToken) return;
 
-    const artifacts = $.read(ARTIFACTS_KEY);
-    if (!artifacts || artifacts.length === 0) return;
+        const artifacts = $.read(ARTIFACTS_KEY);
+        if (!artifacts || artifacts.length === 0) return;
 
-    const shouldSync = artifacts.some((artifact) => artifact.sync);
-    if (shouldSync) await doSync();
+        const shouldSync = artifacts.some((artifact) => artifact.sync);
+        if (shouldSync) await doSync();
+    }
 })().finally(() => $.done());
 
+async function produceArtifacts(names, type) {
+    try {
+        if (names.length > 0) {
+            $.info(`produceArtifacts ${type} 开始: ${names.join(', ')}`);
+            await Promise.all(
+                names.map(async (name) => {
+                    try {
+                        await produceArtifact({
+                            type,
+                            name,
+                        });
+                    } catch (e) {
+                        $.error(`${type} ${name} error: ${e.message ?? e}`);
+                    }
+                }),
+            );
+            $.info(`produceArtifacts ${type} 完成: ${names.join(', ')}`);
+        }
+    } catch (e) {
+        $.error(`produceArtifacts error: ${e.message ?? e}`);
+    }
+}
 async function doSync() {
     console.log(
         `
@@ -30,25 +84,104 @@ async function doSync() {
     const files = {};
 
     try {
+        const invalid = [];
+        const allSubs = $.read(SUBS_KEY);
+        const allCols = $.read(COLLECTIONS_KEY);
+        const subNames = [];
+        allArtifacts.map((artifact) => {
+            if (artifact.sync && artifact.source) {
+                if (artifact.type === 'subscription') {
+                    const subName = artifact.source;
+                    const sub = findByName(allSubs, subName);
+                    if (sub && sub.url && !subNames.includes(subName)) {
+                        subNames.push(subName);
+                    }
+                } else if (artifact.type === 'collection') {
+                    const collection = findByName(allCols, artifact.source);
+                    if (collection && Array.isArray(collection.subscriptions)) {
+                        collection.subscriptions.map((subName) => {
+                            const sub = findByName(allSubs, subName);
+                            if (sub && sub.url && !subNames.includes(subName)) {
+                                subNames.push(subName);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        if (subNames.length > 0) {
+            await Promise.all(
+                subNames.map(async (subName) => {
+                    try {
+                        await produceArtifact({
+                            type: 'subscription',
+                            name: subName,
+                            awaitCustomCache: true,
+                        });
+                    } catch (e) {
+                        // $.error(`${e.message ?? e}`);
+                    }
+                }),
+            );
+        }
         await Promise.all(
             allArtifacts.map(async (artifact) => {
-                if (artifact.sync) {
-                    $.info(`正在同步云配置：${artifact.name}...`);
-                    const output = await produceArtifact({
-                        type: artifact.type,
-                        name: artifact.source,
-                        platform: artifact.platform,
-                    });
+                try {
+                    if (artifact.sync && artifact.source) {
+                        $.info(`正在同步云配置：${artifact.name}...`);
 
-                    files[encodeURIComponent(artifact.name)] = {
-                        content: output,
-                    };
+                        const useMihomoExternal =
+                            artifact.platform === 'SurgeMac';
+
+                        if (useMihomoExternal) {
+                            $.info(
+                                `手动指定了 target 为 SurgeMac, 将使用 Mihomo External`,
+                            );
+                        }
+                        const output = await produceArtifact({
+                            type: artifact.type,
+                            name: artifact.source,
+                            platform: artifact.platform,
+                            produceOpts: {
+                                'include-unsupported-proxy':
+                                    artifact.includeUnsupportedProxy,
+                                useMihomoExternal,
+                            },
+                        });
+
+                        // if (!output || output.length === 0)
+                        //     throw new Error('该配置的结果为空 不进行上传');
+
+                        files[encodeURIComponent(artifact.name)] = {
+                            content: output,
+                        };
+                    }
+                } catch (e) {
+                    $.error(
+                        `同步配置 ${artifact.name} 发生错误: ${e.message ?? e}`,
+                    );
+                    invalid.push(artifact.name);
                 }
             }),
         );
 
+        if (invalid.length > 0) {
+            throw new Error(
+                `同步配置 ${invalid.join(', ')} 发生错误 详情请查看日志`,
+            );
+        }
+
         const resp = await syncToGist(files);
         const body = JSON.parse(resp.body);
+        delete body.history;
+        delete body.forks;
+        delete body.owner;
+        Object.values(body.files).forEach((file) => {
+            delete file.content;
+        });
+        $.info('上传配置响应:');
+        $.info(JSON.stringify(body, null, 2));
 
         for (const artifact of allArtifacts) {
             if (artifact.sync) {
@@ -62,17 +195,26 @@ async function doSync() {
                         files.map((item) => [item.path, item]),
                     );
                 }
-                const url = files[encodeURIComponent(artifact.name)]?.raw_url;
-                artifact.url = isGitLab
-                    ? url
-                    : url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+                const raw_url =
+                    files[encodeURIComponent(artifact.name)]?.raw_url;
+                const new_url = isGitLab
+                    ? raw_url
+                    : raw_url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+                $.info(
+                    `上传配置完成\n文件列表: ${Object.keys(files).join(
+                        ', ',
+                    )}\n当前文件: ${encodeURIComponent(
+                        artifact.name,
+                    )}\n响应返回的原始链接: ${raw_url}\n处理完的新链接: ${new_url}`,
+                );
+                artifact.url = new_url;
             }
         }
 
         $.write(allArtifacts, ARTIFACTS_KEY);
         $.notify('🌍 Sub-Store', '全部订阅同步成功！');
-    } catch (err) {
-        $.notify('🌍 Sub-Store', '同步订阅失败', `原因：${err}`);
-        $.error(`无法同步订阅配置到 Gist，原因：${err}`);
+    } catch (e) {
+        $.notify('🌍 Sub-Store', '同步订阅失败', `原因：${e.message ?? e}`);
+        $.error(`无法同步订阅配置到 Gist，原因：${e}`);
     }
 }

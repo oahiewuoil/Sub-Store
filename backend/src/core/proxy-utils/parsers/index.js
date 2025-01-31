@@ -5,6 +5,7 @@ import {
     isPresent,
     isNotBlank,
     getIfPresent,
+    getRandomPort,
 } from '@/utils';
 import getSurgeParser from './peggy/surge';
 import getLoonParser from './peggy/loon';
@@ -13,9 +14,59 @@ import getTrojanURIParser from './peggy/trojan-uri';
 
 import { Base64 } from 'js-base64';
 
+function surge_port_hopping(raw) {
+    const [parts, port_hopping] =
+        raw.match(
+            /,\s*?port-hopping\s*?=\s*?["']?\s*?((\d+(-\d+)?)([,;]\d+(-\d+)?)*)\s*?["']?\s*?/,
+        ) || [];
+    return {
+        port_hopping: port_hopping
+            ? port_hopping.replace(/;/g, ',')
+            : undefined,
+        line: parts ? raw.replace(parts, '') : raw,
+    };
+}
+
+function URI_PROXY() {
+    // socks5+tls
+    // socks5
+    // http, https(可以这么写)
+    const name = 'URI PROXY Parser';
+    const test = (line) => {
+        return /^(socks5\+tls|socks5|http|https):\/\//.test(line);
+    };
+    const parse = (line) => {
+        // parse url
+        // eslint-disable-next-line no-unused-vars
+        let [__, type, tls, username, password, server, port, query, name] =
+            line.match(
+                /^(socks5|http|http)(\+tls|s)?:\/\/(?:(.*?):(.*?)@)?(.*?):(\d+?)(\?.*?)?(?:#(.*?))?$/,
+            );
+
+        const proxy = {
+            name:
+                name != null
+                    ? decodeURIComponent(name)
+                    : `${type} ${server}:${port}`,
+            type,
+            tls: tls ? true : false,
+            server,
+            port,
+            username:
+                username != null ? decodeURIComponent(username) : undefined,
+            password:
+                password != null ? decodeURIComponent(password) : undefined,
+        };
+
+        return proxy;
+    };
+    return { name, test, parse };
+}
+
 // Parse SS URI format (only supports new SIP002, legacy format is depreciated).
 // reference: https://github.com/shadowsocks/shadowsocks-org/wiki/SIP002-URI-Scheme
 function URI_SS() {
+    // TODO: 暂不支持 httpupgrade
     const name = 'URI SS Parser';
     const test = (line) => {
         return /^ss:\/\//.test(line);
@@ -31,22 +82,54 @@ function URI_SS() {
         content = content.split('#')[0]; // strip proxy name
         // handle IPV4 and IPV6
         let serverAndPortArray = content.match(/@([^/]*)(\/|$)/);
-        let userInfoStr = Base64.decode(content.split('@')[0]);
+
+        let rawUserInfoStr = decodeURIComponent(content.split('@')[0]); // 其实应该分隔之后, 用户名和密码再 decodeURIComponent. 但是问题不大
+        let userInfoStr;
+        if (rawUserInfoStr?.startsWith('2022-blake3-')) {
+            userInfoStr = rawUserInfoStr;
+        } else {
+            userInfoStr = Base64.decode(rawUserInfoStr);
+        }
+
+        let query = '';
         if (!serverAndPortArray) {
+            if (content.includes('?')) {
+                const parsed = content.match(/^(.*)(\?.*)$/);
+                content = parsed[1];
+                query = parsed[2];
+            }
             content = Base64.decode(content);
+            if (query) {
+                if (/(&|\?)v2ray-plugin=/.test(query)) {
+                    const parsed = query.match(/(&|\?)v2ray-plugin=(.*?)(&|$)/);
+                    let v2rayPlugin = parsed[2];
+                    if (v2rayPlugin) {
+                        proxy.plugin = 'v2ray-plugin';
+                        proxy['plugin-opts'] = JSON.parse(
+                            Base64.decode(v2rayPlugin),
+                        );
+                    }
+                }
+                content = `${content}${query}`;
+            }
             userInfoStr = content.split('@')[0];
             serverAndPortArray = content.match(/@([^/]*)(\/|$)/);
         }
+
         const serverAndPort = serverAndPortArray[1];
         const portIdx = serverAndPort.lastIndexOf(':');
         proxy.server = serverAndPort.substring(0, portIdx);
         proxy.port = `${serverAndPort.substring(portIdx + 1)}`.match(
             /\d+/,
         )?.[0];
-
-        const userInfo = userInfoStr.split(':');
-        proxy.cipher = userInfo[0];
-        proxy.password = userInfo[1];
+        let userInfo = userInfoStr.match(/(^.*?):(.*$)/);
+        proxy.cipher = userInfo?.[1];
+        proxy.password = userInfo?.[2];
+        // if (!proxy.cipher || !proxy.password) {
+        //     userInfo = rawUserInfoStr.match(/(^.*?):(.*$)/);
+        //     proxy.cipher = userInfo?.[1];
+        //     proxy.password = userInfo?.[2];
+        // }
 
         // handle obfs
         const idx = content.indexOf('?plugin=');
@@ -70,7 +153,7 @@ function URI_SS() {
                     };
                     break;
                 case 'v2ray-plugin':
-                    proxy.obfs = 'v2ray-plugin';
+                    proxy.plugin = 'v2ray-plugin';
                     proxy['plugin-opts'] = {
                         mode: 'websocket',
                         host: getIfNotBlank(params['obfs-host']),
@@ -83,6 +166,12 @@ function URI_SS() {
                         `Unsupported plugin option: ${params.plugin}`,
                     );
             }
+        }
+        if (/(&|\?)uot=(1|true)/i.test(query)) {
+            proxy['udp-over-tcp'] = true;
+        }
+        if (/(&|\?)tfo=(1|true)/i.test(query)) {
+            proxy.tfo = true;
         }
         return proxy;
     };
@@ -132,7 +221,7 @@ function URI_SSR() {
             for (const item of line) {
                 let [key, val] = item.split('=');
                 val = val.trim();
-                if (val.length > 0) {
+                if (val.length > 0 && val !== '(null)') {
                     other_params[key] = val;
                 }
             }
@@ -248,11 +337,17 @@ function URI_VMess() {
                 params.port = port;
                 params.add = server;
             }
+            const server = params.add;
+            const port = parseInt(getIfPresent(params.port), 10);
             const proxy = {
-                name: params.ps ?? params.remarks,
+                name:
+                    params.ps ??
+                    params.remarks ??
+                    params.remark ??
+                    `VMess ${server}:${port}`,
                 type: 'vmess',
-                server: params.add,
-                port: parseInt(getIfPresent(params.port), 10),
+                server,
+                port,
                 cipher: getIfPresent(params.scy, 'auto'),
                 uuid: params.id,
                 alterId: parseInt(
@@ -264,21 +359,40 @@ function URI_VMess() {
                     ? !params.verify_cert
                     : undefined,
             };
+            if (!proxy['skip-cert-verify'] && isPresent(params.allowInsecure)) {
+                proxy['skip-cert-verify'] = /(TRUE)|1/i.test(
+                    params.allowInsecure,
+                );
+            }
             // https://github.com/2dust/v2rayN/wiki/%E5%88%86%E4%BA%AB%E9%93%BE%E6%8E%A5%E6%A0%BC%E5%BC%8F%E8%AF%B4%E6%98%8E(ver-2)
-            if (proxy.tls && proxy.sni) {
+            if (proxy.tls && params.sni && params.sni !== '') {
                 proxy.sni = params.sni;
             }
+            let httpupgrade = false;
             // handle obfs
             if (params.net === 'ws' || params.obfs === 'websocket') {
                 proxy.network = 'ws';
             } else if (
-                ['tcp', 'http'].includes(params.net) ||
-                params.obfs === 'http'
+                ['http'].includes(params.net) ||
+                ['http'].includes(params.obfs) ||
+                ['http'].includes(params.type)
             ) {
                 proxy.network = 'http';
             } else if (['grpc'].includes(params.net)) {
                 proxy.network = 'grpc';
+            } else if (
+                params.net === 'httpupgrade' ||
+                proxy.network === 'httpupgrade'
+            ) {
+                proxy.network = 'ws';
+                httpupgrade = true;
+            } else if (params.net === 'h2' || proxy.network === 'h2') {
+                proxy.network = 'h2';
             }
+            // 暂不支持 tcp + host + path
+            // else if (params.net === 'tcp' || proxy.network === 'tcp') {
+            //     proxy.network = 'tcp';
+            // }
             if (proxy.network) {
                 let transportHost = params.host ?? params.obfsParam;
                 try {
@@ -293,6 +407,10 @@ function URI_VMess() {
 
                 if (proxy.network === 'http') {
                     if (transportHost) {
+                        // 1)http(tcp)->host中间逗号(,)隔开
+                        transportHost = transportHost
+                            .split(',')
+                            .map((i) => i.trim());
                         transportHost = Array.isArray(transportHost)
                             ? transportHost[0]
                             : transportHost;
@@ -301,28 +419,31 @@ function URI_VMess() {
                         transportPath = Array.isArray(transportPath)
                             ? transportPath[0]
                             : transportPath;
+                    } else {
+                        transportPath = '/';
                     }
                 }
+                // 传输层应该有配置, 暂时不考虑兼容不给配置的节点
                 if (transportPath || transportHost) {
                     if (['grpc'].includes(proxy.network)) {
                         proxy[`${proxy.network}-opts`] = {
                             'grpc-service-name': getIfNotBlank(transportPath),
                             '_grpc-type': getIfNotBlank(params.type),
+                            '_grpc-authority': getIfNotBlank(params.authority),
                         };
                     } else {
-                        proxy[`${proxy.network}-opts`] = {
+                        const opts = {
                             path: getIfNotBlank(transportPath),
                             headers: { Host: getIfNotBlank(transportHost) },
                         };
+                        if (httpupgrade) {
+                            opts['v2ray-http-upgrade'] = true;
+                            opts['v2ray-http-upgrade-fast-open'] = true;
+                        }
+                        proxy[`${proxy.network}-opts`] = opts;
                     }
                 } else {
                     delete proxy.network;
-                }
-
-                // https://github.com/MetaCubeX/Clash.Meta/blob/Alpha/docs/config.yaml#L413
-                // sni 优先级应高于 host
-                if (proxy.tls && !proxy.sni && transportHost) {
-                    proxy.sni = transportHost;
                 }
             }
             return proxy;
@@ -374,14 +495,18 @@ function URI_VLESS() {
             params[key] = value;
         }
 
-        proxy.name = name ?? params.remarks ?? `VLESS ${server}:${port}`;
+        proxy.name =
+            name ??
+            params.remarks ??
+            params.remark ??
+            `VLESS ${server}:${port}`;
 
         proxy.tls = params.security && params.security !== 'none';
         if (isShadowrocket && /TRUE|1/i.test(params.tls)) {
             proxy.tls = true;
             params.security = params.security ?? 'reality';
         }
-        proxy.sni = params.sni ?? params.peer;
+        proxy.sni = params.sni || params.peer;
         proxy.flow = params.flow;
         if (!proxy.flow && isShadowrocket && params.xtls) {
             // "none" is undefined
@@ -409,23 +534,45 @@ function URI_VLESS() {
                 proxy[`${params.security}-opts`] = opts;
             }
         }
+        let httpupgrade = false;
         proxy.network = params.type;
         if (proxy.network === 'tcp' && params.headerType === 'http') {
             proxy.network = 'http';
+        } else if (proxy.network === 'httpupgrade') {
+            proxy.network = 'ws';
+            httpupgrade = true;
         }
         if (!proxy.network && isShadowrocket && params.obfs) {
             proxy.network = params.obfs;
         }
+        if (['websocket'].includes(proxy.network)) {
+            proxy.network = 'ws';
+        }
         if (proxy.network && !['tcp', 'none'].includes(proxy.network)) {
             const opts = {};
-            if (params.host) {
-                opts.headers = { Host: params.host };
+            const host = params.host ?? params.obfsParam;
+            if (host) {
+                if (params.obfsParam) {
+                    try {
+                        const parsed = JSON.parse(host);
+                        opts.headers = parsed;
+                    } catch (e) {
+                        opts.headers = { Host: host };
+                    }
+                } else {
+                    opts.headers = { Host: host };
+                }
             }
             if (params.serviceName) {
                 opts[`${proxy.network}-service-name`] = params.serviceName;
+                if (['grpc'].includes(proxy.network) && params.authority) {
+                    opts['_grpc-authority'] = params.authority;
+                }
             } else if (isShadowrocket && params.path) {
-                opts[`${proxy.network}-service-name`] = params.path;
-                delete params.path;
+                if (!['ws', 'http', 'h2'].includes(proxy.network)) {
+                    opts[`${proxy.network}-service-name`] = params.path;
+                    delete params.path;
+                }
             }
             if (params.path) {
                 opts.path = params.path;
@@ -434,17 +581,23 @@ function URI_VLESS() {
             if (['grpc'].includes(proxy.network)) {
                 opts['_grpc-type'] = params.mode || 'gun';
             }
+            if (httpupgrade) {
+                opts['v2ray-http-upgrade'] = true;
+                opts['v2ray-http-upgrade-fast-open'] = true;
+            }
             if (Object.keys(opts).length > 0) {
                 proxy[`${proxy.network}-opts`] = opts;
             }
-        }
-
-        if (proxy.tls && !proxy.sni) {
-            if (proxy.network === 'ws') {
-                proxy.sni = proxy['ws-opts']?.headers?.Host;
-            } else if (proxy.network === 'http') {
-                let httpHost = proxy['http-opts']?.headers?.Host;
-                proxy.sni = Array.isArray(httpHost) ? httpHost[0] : httpHost;
+            if (proxy.network === 'kcp') {
+                // mKCP 种子。省略时不使用种子，但不可以为空字符串。建议 mKCP 用户使用 seed。
+                if (params.seed) {
+                    proxy.seed = params.seed;
+                }
+                // mKCP 的伪装头部类型。当前可选值有 none / srtp / utp / wechat-video / dtls / wireguard。省略时默认值为 none，即不使用伪装头部，但不可以为空字符串。
+                proxy.headerType = params.headerType || 'none';
+            }
+            if (params.extra) {
+                proxy.extra = params.extra;
             }
         }
 
@@ -459,13 +612,42 @@ function URI_Hysteria2() {
     };
     const parse = (line) => {
         line = line.split(/(hysteria2|hy2):\/\//)[2];
-        // eslint-disable-next-line no-unused-vars
-        let [__, password, server, ___, port, ____, addons = '', name] =
-            /^(.*?)@(.*?)(:(\d+))?\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
-        port = parseInt(`${port}`, 10);
-        if (isNaN(port)) {
+        // 端口跳跃有两种写法:
+        // 1. 服务器的地址和可选端口。如果省略端口，则默认为 443。
+        // 端口部分支持 端口跳跃 的「多端口地址格式」。
+        // https://hysteria.network/zh/docs/advanced/Port-Hopping
+        // 2. 参数 mport
+        let ports;
+        /* eslint-disable no-unused-vars */
+        let [
+            __,
+            password,
+            server,
+            ___,
+            port,
+            ____,
+            _____,
+            ______,
+            _______,
+            ________,
+            addons = '',
+            name,
+        ] = /^(.*?)@(.*?)(:((\d+(-\d+)?)([,;]\d+(-\d+)?)*))?\/?(\?(.*?))?(?:#(.*?))?$/.exec(
+            line,
+        );
+        /* eslint-enable no-unused-vars */
+        if (/^\d+$/.test(port)) {
+            port = parseInt(`${port}`, 10);
+            if (isNaN(port)) {
+                port = 443;
+            }
+        } else if (port) {
+            ports = port;
+            port = getRandomPort(ports);
+        } else {
             port = 443;
         }
+
         password = decodeURIComponent(password);
         if (name != null) {
             name = decodeURIComponent(name);
@@ -477,6 +659,7 @@ function URI_Hysteria2() {
             name,
             server,
             port,
+            ports,
             password,
         };
 
@@ -496,10 +679,211 @@ function URI_Hysteria2() {
             proxy.obfs = params.obfs;
         }
 
+        proxy.ports = params.mport;
         proxy['obfs-password'] = params['obfs-password'];
         proxy['skip-cert-verify'] = /(TRUE)|1/i.test(params.insecure);
         proxy.tfo = /(TRUE)|1/i.test(params.fastopen);
         proxy['tls-fingerprint'] = params.pinSHA256;
+
+        return proxy;
+    };
+    return { name, test, parse };
+}
+function URI_Hysteria() {
+    const name = 'URI Hysteria Parser';
+    const test = (line) => {
+        return /^(hysteria|hy):\/\//.test(line);
+    };
+    const parse = (line) => {
+        line = line.split(/(hysteria|hy):\/\//)[2];
+        // eslint-disable-next-line no-unused-vars
+        let [__, server, ___, port, ____, addons = '', name] =
+            /^(.*?)(:(\d+))?\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
+        port = parseInt(`${port}`, 10);
+        if (isNaN(port)) {
+            port = 443;
+        }
+        if (name != null) {
+            name = decodeURIComponent(name);
+        }
+        name = name ?? `Hysteria ${server}:${port}`;
+
+        const proxy = {
+            type: 'hysteria',
+            name,
+            server,
+            port,
+        };
+        const params = {};
+        for (const addon of addons.split('&')) {
+            let [key, value] = addon.split('=');
+            key = key.replace(/_/, '-');
+            value = decodeURIComponent(value);
+            if (['alpn'].includes(key)) {
+                proxy[key] = value ? value.split(',') : undefined;
+            } else if (['insecure'].includes(key)) {
+                proxy['skip-cert-verify'] = /(TRUE)|1/i.test(value);
+            } else if (['auth'].includes(key)) {
+                proxy['auth-str'] = value;
+            } else if (['mport'].includes(key)) {
+                proxy['ports'] = value;
+            } else if (['obfsParam'].includes(key)) {
+                proxy['obfs'] = value;
+            } else if (['upmbps'].includes(key)) {
+                proxy['up'] = value;
+            } else if (['downmbps'].includes(key)) {
+                proxy['down'] = value;
+            } else if (['obfs'].includes(key)) {
+                // obfs: Obfuscation mode (optional, empty or "xplus")
+                proxy['_obfs'] = value || '';
+            } else if (['fast-open', 'peer'].includes(key)) {
+                params[key] = value;
+            } else {
+                proxy[key] = value;
+            }
+        }
+
+        if (!proxy.sni && params.peer) {
+            proxy.sni = params.peer;
+        }
+        if (!proxy['fast-open'] && params.fastopen) {
+            proxy['fast-open'] = true;
+        }
+        if (!proxy.protocol) {
+            // protocol: protocol to use ("udp", "wechat-video", "faketcp") (optional, default: "udp")
+            proxy.protocol = 'udp';
+        }
+
+        return proxy;
+    };
+    return { name, test, parse };
+}
+function URI_TUIC() {
+    const name = 'URI TUIC Parser';
+    const test = (line) => {
+        return /^tuic:\/\//.test(line);
+    };
+    const parse = (line) => {
+        line = line.split(/tuic:\/\//)[1];
+        // eslint-disable-next-line no-unused-vars
+        let [__, uuid, password, server, ___, port, ____, addons = '', name] =
+            /^(.*?):(.*?)@(.*?)(:(\d+))?\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
+        port = parseInt(`${port}`, 10);
+        if (isNaN(port)) {
+            port = 443;
+        }
+        password = decodeURIComponent(password);
+        if (name != null) {
+            name = decodeURIComponent(name);
+        }
+        name = name ?? `TUIC ${server}:${port}`;
+
+        const proxy = {
+            type: 'tuic',
+            name,
+            server,
+            port,
+            password,
+            uuid,
+        };
+
+        for (const addon of addons.split('&')) {
+            let [key, value] = addon.split('=');
+            key = key.replace(/_/, '-');
+            value = decodeURIComponent(value);
+            if (['alpn'].includes(key)) {
+                proxy[key] = value ? value.split(',') : undefined;
+            } else if (['allow-insecure'].includes(key)) {
+                proxy['skip-cert-verify'] = /(TRUE)|1/i.test(value);
+            } else if (['disable-sni', 'reduce-rtt'].includes(key)) {
+                proxy[key] = /(TRUE)|1/i.test(value);
+            } else {
+                proxy[key] = value;
+            }
+        }
+
+        return proxy;
+    };
+    return { name, test, parse };
+}
+function URI_WireGuard() {
+    const name = 'URI WireGuard Parser';
+    const test = (line) => {
+        return /^(wireguard|wg):\/\//.test(line);
+    };
+    const parse = (line) => {
+        line = line.split(/(wireguard|wg):\/\//)[2];
+        /* eslint-disable no-unused-vars */
+        let [
+            __,
+            ___,
+            privateKey,
+            server,
+            ____,
+            port,
+            _____,
+            addons = '',
+            name,
+        ] = /^((.*?)@)?(.*?)(:(\d+))?\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
+        /* eslint-enable no-unused-vars */
+
+        port = parseInt(`${port}`, 10);
+        if (isNaN(port)) {
+            port = 51820;
+        }
+        privateKey = decodeURIComponent(privateKey);
+        if (name != null) {
+            name = decodeURIComponent(name);
+        }
+        name = name ?? `WireGuard ${server}:${port}`;
+        const proxy = {
+            type: 'wireguard',
+            name,
+            server,
+            port,
+            'private-key': privateKey,
+            udp: true,
+        };
+        for (const addon of addons.split('&')) {
+            let [key, value] = addon.split('=');
+            key = key.replace(/_/, '-');
+            value = decodeURIComponent(value);
+            if (['reserved'].includes(key)) {
+                const parsed = value
+                    .split(',')
+                    .map((i) => parseInt(i.trim(), 10))
+                    .filter((i) => Number.isInteger(i));
+                if (parsed.length === 3) {
+                    proxy[key] = parsed;
+                }
+            } else if (['address', 'ip'].includes(key)) {
+                value.split(',').map((i) => {
+                    const ip = i
+                        .trim()
+                        .replace(/\/\d+$/, '')
+                        .replace(/^\[/, '')
+                        .replace(/\]$/, '');
+                    if (isIPv4(ip)) {
+                        proxy.ip = ip;
+                    } else if (isIPv6(ip)) {
+                        proxy.ipv6 = ip;
+                    }
+                });
+            } else if (['mtu'].includes(key)) {
+                const parsed = parseInt(value.trim(), 10);
+                if (Number.isInteger(parsed)) {
+                    proxy[key] = parsed;
+                }
+            } else if (/publickey/i.test(key)) {
+                proxy['public-key'] = value;
+            } else if (/privatekey/i.test(key)) {
+                proxy['private-key'] = value;
+            } else if (['udp'].includes(key)) {
+                proxy[key] = /(TRUE)|1/i.test(value);
+            } else if (!['flag'].includes(key)) {
+                proxy[key] = value;
+            }
+        }
 
         return proxy;
     };
@@ -514,6 +898,11 @@ function URI_Trojan() {
     };
 
     const parse = (line) => {
+        const matched = /^(trojan:\/\/.*?@.*?)(:(\d+))?\/?(\?.*?)?$/.exec(line);
+        const port = matched?.[2];
+        if (!port) {
+            line = line.replace(matched[1], `${matched[1]}:443`);
+        }
         let [newLine, name] = line.split(/#(.+)/, 2);
         const parser = getTrojanURIParser();
         const proxy = parser.parse(newLine);
@@ -543,6 +932,8 @@ function Clash_All() {
         const proxy = JSON.parse(line);
         if (
             ![
+                'mieru',
+                'juicity',
                 'ss',
                 'ssr',
                 'vmess',
@@ -555,6 +946,8 @@ function Clash_All() {
                 'hysteria',
                 'hysteria2',
                 'wireguard',
+                'ssh',
+                'direct',
             ].includes(proxy.type)
         ) {
             throw new Error(
@@ -566,24 +959,22 @@ function Clash_All() {
         if (['vmess', 'vless'].includes(proxy.type)) {
             proxy.sni = proxy.servername;
             delete proxy.servername;
-            if (proxy.tls && !proxy.sni) {
-                if (proxy.network === 'ws') {
-                    proxy.sni = proxy['ws-opts']?.headers?.Host;
-                } else if (proxy.network === 'http') {
-                    let httpHost = proxy['http-opts']?.headers?.Host;
-                    proxy.sni = Array.isArray(httpHost)
-                        ? httpHost[0]
-                        : httpHost;
-                }
-            }
         }
-
+        if (proxy['server-cert-fingerprint']) {
+            proxy['tls-fingerprint'] = proxy['server-cert-fingerprint'];
+        }
         if (proxy.fingerprint) {
             proxy['tls-fingerprint'] = proxy.fingerprint;
+        }
+        if (proxy['dialer-proxy']) {
+            proxy['underlying-proxy'] = proxy['dialer-proxy'];
         }
 
         if (proxy['benchmark-url']) {
             proxy['test-url'] = proxy['benchmark-url'];
+        }
+        if (proxy['benchmark-timeout']) {
+            proxy['test-timeout'] = proxy['benchmark-timeout'];
         }
 
         return proxy;
@@ -737,6 +1128,15 @@ function Loon_Http() {
     const parse = (line) => getLoonParser().parse(line);
     return { name, test, parse };
 }
+function Loon_Socks5() {
+    const name = 'Loon SOCKS5 Parser';
+    const test = (line) => {
+        return /^.*=\s*socks5/i.test(line.split(',')[0]);
+    };
+
+    const parse = (line) => getLoonParser().parse(line);
+    return { name, test, parse };
+}
 
 function Loon_WireGuard() {
     const name = 'Loon WireGuard Parser';
@@ -846,6 +1246,22 @@ function Loon_WireGuard() {
     return { name, test, parse };
 }
 
+function Surge_Direct() {
+    const name = 'Surge Direct Parser';
+    const test = (line) => {
+        return /^.*=\s*direct/.test(line.split(',')[0]);
+    };
+    const parse = (line) => getSurgeParser().parse(line);
+    return { name, test, parse };
+}
+function Surge_SSH() {
+    const name = 'Surge SSH Parser';
+    const test = (line) => {
+        return /^.*=\s*ssh/.test(line.split(',')[0]);
+    };
+    const parse = (line) => getSurgeParser().parse(line);
+    return { name, test, parse };
+}
 function Surge_SS() {
     const name = 'Surge SS Parser';
     const test = (line) => {
@@ -981,7 +1397,12 @@ function Surge_Tuic() {
     const test = (line) => {
         return /^.*=\s*tuic(-v5)?/.test(line.split(',')[0]);
     };
-    const parse = (line) => getSurgeParser().parse(line);
+    const parse = (raw) => {
+        const { port_hopping, line } = surge_port_hopping(raw);
+        const proxy = getSurgeParser().parse(line);
+        proxy['ports'] = port_hopping;
+        return proxy;
+    };
     return { name, test, parse };
 }
 function Surge_WireGuard() {
@@ -998,7 +1419,12 @@ function Surge_Hysteria2() {
     const test = (line) => {
         return /^.*=\s*hysteria2/.test(line.split(',')[0]);
     };
-    const parse = (line) => getSurgeParser().parse(line);
+    const parse = (raw) => {
+        const { port_hopping, line } = surge_port_hopping(raw);
+        const proxy = getSurgeParser().parse(line);
+        proxy['ports'] = port_hopping;
+        return proxy;
+    };
     return { name, test, parse };
 }
 
@@ -1007,13 +1433,19 @@ function isIP(ip) {
 }
 
 export default [
+    URI_PROXY(),
     URI_SS(),
     URI_SSR(),
     URI_VMess(),
     URI_VLESS(),
+    URI_TUIC(),
+    URI_WireGuard(),
+    URI_Hysteria(),
     URI_Hysteria2(),
     URI_Trojan(),
     Clash_All(),
+    Surge_Direct(),
+    Surge_SSH(),
     Surge_SS(),
     Surge_VMess(),
     Surge_Trojan(),
@@ -1031,6 +1463,7 @@ export default [
     Loon_Hysteria2(),
     Loon_Trojan(),
     Loon_Http(),
+    Loon_Socks5(),
     Loon_WireGuard(),
     QX_SS(),
     QX_SSR(),
