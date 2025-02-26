@@ -8,6 +8,8 @@ export default function ClashMeta_Producer() {
                 if (opts['include-unsupported-proxy']) return true;
                 if (proxy.type === 'snell' && String(proxy.version) === '4') {
                     return false;
+                } else if (['juicity'].includes(proxy.type)) {
+                    return false;
                 }
                 return true;
             })
@@ -30,9 +32,10 @@ export default function ClashMeta_Producer() {
                         isPresent(proxy, 'cipher') &&
                         ![
                             'auto',
+                            'none',
+                            'zero',
                             'aes-128-gcm',
                             'chacha20-poly1305',
-                            'none',
                         ].includes(proxy.cipher)
                     ) {
                         proxy.cipher = 'auto';
@@ -84,10 +87,27 @@ export default function ClashMeta_Producer() {
                     proxy['preshared-key'] =
                         proxy['preshared-key'] ?? proxy['pre-shared-key'];
                     proxy['pre-shared-key'] = proxy['preshared-key'];
+                } else if (proxy.type === 'snell' && proxy.version < 3) {
+                    delete proxy.udp;
                 } else if (proxy.type === 'vless') {
                     if (isPresent(proxy, 'sni')) {
                         proxy.servername = proxy.sni;
                         delete proxy.sni;
+                    }
+                } else if (proxy.type === 'ss') {
+                    if (
+                        isPresent(proxy, 'shadow-tls-password') &&
+                        !isPresent(proxy, 'plugin')
+                    ) {
+                        proxy.plugin = 'shadow-tls';
+                        proxy['plugin-opts'] = {
+                            host: proxy['shadow-tls-sni'],
+                            password: proxy['shadow-tls-password'],
+                            version: proxy['shadow-tls-version'],
+                        };
+                        delete proxy['shadow-tls-password'];
+                        delete proxy['shadow-tls-sni'];
+                        delete proxy['shadow-tls-version'];
                     }
                 }
 
@@ -110,11 +130,41 @@ export default function ClashMeta_Producer() {
                         proxy['http-opts'].headers.Host = [httpHost];
                     }
                 }
-
                 if (
-                    ['trojan', 'tuic', 'hysteria', 'hysteria2'].includes(
-                        proxy.type,
-                    )
+                    ['vmess', 'vless'].includes(proxy.type) &&
+                    proxy.network === 'h2'
+                ) {
+                    let path = proxy['h2-opts']?.path;
+                    if (
+                        isPresent(proxy, 'h2-opts.path') &&
+                        Array.isArray(path)
+                    ) {
+                        proxy['h2-opts'].path = path[0];
+                    }
+                    let host = proxy['h2-opts']?.headers?.host;
+                    if (
+                        isPresent(proxy, 'h2-opts.headers.Host') &&
+                        !Array.isArray(host)
+                    ) {
+                        proxy['h2-opts'].headers.host = [host];
+                    }
+                }
+
+                if (proxy['plugin-opts']?.tls) {
+                    if (isPresent(proxy, 'skip-cert-verify')) {
+                        proxy['plugin-opts']['skip-cert-verify'] =
+                            proxy['skip-cert-verify'];
+                    }
+                }
+                if (
+                    [
+                        'trojan',
+                        'tuic',
+                        'hysteria',
+                        'hysteria2',
+                        'juicity',
+                        'anytls',
+                    ].includes(proxy.type)
                 ) {
                     delete proxy.tls;
                 }
@@ -123,13 +173,33 @@ export default function ClashMeta_Producer() {
                     proxy.fingerprint = proxy['tls-fingerprint'];
                 }
                 delete proxy['tls-fingerprint'];
+
+                if (proxy['underlying-proxy']) {
+                    proxy['dialer-proxy'] = proxy['underlying-proxy'];
+                }
+                delete proxy['underlying-proxy'];
+
+                if (isPresent(proxy, 'tls') && typeof proxy.tls !== 'boolean') {
+                    delete proxy.tls;
+                }
                 delete proxy.subName;
                 delete proxy.collectionName;
+                delete proxy.id;
+                delete proxy.resolved;
+                delete proxy['no-resolve'];
+                if (type !== 'internal' || opts['delete-underscore-fields']) {
+                    for (const key in proxy) {
+                        if (proxy[key] == null || /^_/i.test(key)) {
+                            delete proxy[key];
+                        }
+                    }
+                }
                 if (
                     ['grpc'].includes(proxy.network) &&
                     proxy[`${proxy.network}-opts`]
                 ) {
                     delete proxy[`${proxy.network}-opts`]['_grpc-type'];
+                    delete proxy[`${proxy.network}-opts`]['_grpc-authority'];
                 }
                 return proxy;
             });

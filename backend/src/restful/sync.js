@@ -35,13 +35,25 @@ async function produceArtifact({
     ignoreFailedRemoteFile,
     produceType,
     produceOpts = {},
+    subscription,
+    awaitCustomCache,
+    $options,
+    proxy,
+    noCache,
 }) {
     platform = platform || 'JSON';
 
     if (type === 'subscription') {
-        const allSubs = $.read(SUBS_KEY);
-        const sub = findByName(allSubs, name);
-        if (!sub) throw new Error(`找不到订阅 ${name}`);
+        let sub;
+        if (name) {
+            const allSubs = $.read(SUBS_KEY);
+            sub = findByName(allSubs, name);
+            if (!sub) throw new Error(`找不到订阅 ${name}`);
+        } else if (subscription) {
+            sub = subscription;
+        } else {
+            throw new Error('未提供订阅名称或订阅数据');
+        }
         let raw;
         if (content && !['localFirst', 'remoteFirst'].includes(mergeSources)) {
             raw = content;
@@ -54,7 +66,16 @@ async function produceArtifact({
                     .filter((i) => i.length)
                     .map(async (url) => {
                         try {
-                            return await download(url, ua || sub.ua);
+                            return await download(
+                                url,
+                                ua || sub.ua,
+                                undefined,
+                                proxy || sub.proxy,
+                                undefined,
+                                awaitCustomCache,
+                                noCache || sub.noCache,
+                                true,
+                            );
                         } catch (err) {
                             errors[url] = err;
                             $.error(
@@ -94,7 +115,16 @@ async function produceArtifact({
                     .filter((i) => i.length)
                     .map(async (url) => {
                         try {
-                            return await download(url, ua || sub.ua);
+                            return await download(
+                                url,
+                                ua || sub.ua,
+                                undefined,
+                                proxy || sub.proxy,
+                                undefined,
+                                awaitCustomCache,
+                                noCache || sub.noCache,
+                                true,
+                            );
                         } catch (err) {
                             errors[url] = err;
                             $.error(
@@ -127,7 +157,8 @@ async function produceArtifact({
             .flat();
 
         proxies.forEach((proxy) => {
-            proxy.subName = sub.name;
+            proxy._subName = sub.name;
+            proxy._subDisplayName = sub.displayName;
         });
         // apply processors
         proxies = await ProxyUtils.process(
@@ -135,6 +166,7 @@ async function produceArtifact({
             sub.process || [],
             platform,
             { [sub.name]: sub },
+            $options,
         );
         if (proxies.length === 0) {
             throw new Error(`订阅 ${name} 中不含有效节点`);
@@ -163,7 +195,20 @@ async function produceArtifact({
         const allCols = $.read(COLLECTIONS_KEY);
         const collection = findByName(allCols, name);
         if (!collection) throw new Error(`找不到组合订阅 ${name}`);
-        const subnames = collection.subscriptions;
+        const subnames = [...collection.subscriptions];
+        let subscriptionTags = collection.subscriptionTags;
+        if (Array.isArray(subscriptionTags) && subscriptionTags.length > 0) {
+            allSubs.forEach((sub) => {
+                if (
+                    Array.isArray(sub.tag) &&
+                    sub.tag.length > 0 &&
+                    !subnames.includes(sub.name) &&
+                    sub.tag.some((tag) => subscriptionTags.includes(tag))
+                ) {
+                    subnames.push(sub.name);
+                }
+            });
+        }
         const results = {};
         const errors = {};
         let processed = 0;
@@ -171,6 +216,14 @@ async function produceArtifact({
         await Promise.all(
             subnames.map(async (name) => {
                 const sub = findByName(allSubs, name);
+                const passThroughUA = sub.passThroughUA;
+                let reqUA = sub.ua;
+                if (passThroughUA) {
+                    $.info(
+                        `订阅开启了透传 User-Agent, 使用请求的 User-Agent: ${ua}`,
+                    );
+                    reqUA = ua;
+                }
                 try {
                     $.info(`正在处理子订阅：${sub.name}...`);
                     let raw;
@@ -190,7 +243,18 @@ async function produceArtifact({
                                 .filter((i) => i.length)
                                 .map(async (url) => {
                                     try {
-                                        return await download(url, sub.ua);
+                                        return await download(
+                                            url,
+                                            reqUA,
+                                            undefined,
+                                            proxy ||
+                                                sub.proxy ||
+                                                collection.proxy,
+                                            undefined,
+                                            undefined,
+                                            noCache || sub.noCache,
+                                            true,
+                                        );
                                     } catch (err) {
                                         errors[url] = err;
                                         $.error(
@@ -222,8 +286,10 @@ async function produceArtifact({
                         .flat();
 
                     currentProxies.forEach((proxy) => {
-                        proxy.subName = sub.name;
-                        proxy.collectionName = collection.name;
+                        proxy._subName = sub.name;
+                        proxy._subDisplayName = sub.displayName;
+                        proxy._collectionName = collection.name;
+                        proxy._collectionDisplayName = collection.displayName;
                     });
 
                     // apply processors
@@ -231,7 +297,11 @@ async function produceArtifact({
                         currentProxies,
                         sub.process || [],
                         platform,
-                        { [sub.name]: sub, _collection: collection },
+                        {
+                            [sub.name]: sub,
+                            _collection: collection,
+                            $options,
+                        },
                     );
                     results[name] = currentProxies;
                     processed++;
@@ -275,7 +345,8 @@ async function produceArtifact({
         );
 
         proxies.forEach((proxy) => {
-            proxy.collectionName = collection.name;
+            proxy._collectionName = collection.name;
+            proxy._collectionDisplayName = collection.displayName;
         });
 
         // apply own processors
@@ -284,6 +355,7 @@ async function produceArtifact({
             collection.process || [],
             platform,
             { _collection: collection },
+            $options,
         );
         if (proxies.length === 0) {
             throw new Error(`组合订阅 ${name} 中不含有效节点`);
@@ -338,89 +410,117 @@ async function produceArtifact({
         const allFiles = $.read(FILES_KEY);
         const file = findByName(allFiles, name);
         if (!file) throw new Error(`找不到文件 ${name}`);
-        let raw;
-        if (content && !['localFirst', 'remoteFirst'].includes(mergeSources)) {
-            raw = content;
-        } else if (url) {
-            const errors = {};
-            raw = await Promise.all(
-                url
-                    .split(/[\r\n]+/)
-                    .map((i) => i.trim())
-                    .filter((i) => i.length)
-                    .map(async (url) => {
-                        try {
-                            return await download(url, ua || file.ua);
-                        } catch (err) {
-                            errors[url] = err;
-                            $.error(
-                                `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
-                            );
-                            return '';
-                        }
-                    }),
-            );
-            let fileIgnoreFailedRemoteFile = file.ignoreFailedRemoteFile;
+        let raw = '';
+        console.log(file);
+        if (file.type !== 'mihomoProfile') {
             if (
-                ignoreFailedRemoteFile != null &&
-                ignoreFailedRemoteFile !== ''
+                content &&
+                !['localFirst', 'remoteFirst'].includes(mergeSources)
             ) {
-                fileIgnoreFailedRemoteFile = ignoreFailedRemoteFile;
-            }
-            if (!fileIgnoreFailedRemoteFile && Object.keys(errors).length > 0) {
-                throw new Error(
-                    `文件 ${file.name} 的远程文件 ${Object.keys(errors).join(
-                        ', ',
-                    )} 发生错误, 请查看日志`,
+                raw = content;
+            } else if (url) {
+                const errors = {};
+                raw = await Promise.all(
+                    url
+                        .split(/[\r\n]+/)
+                        .map((i) => i.trim())
+                        .filter((i) => i.length)
+                        .map(async (url) => {
+                            try {
+                                return await download(
+                                    url,
+                                    ua || file.ua,
+                                    undefined,
+                                    file.proxy || proxy,
+                                    undefined,
+                                    undefined,
+                                    noCache,
+                                );
+                            } catch (err) {
+                                errors[url] = err;
+                                $.error(
+                                    `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
+                                );
+                                return '';
+                            }
+                        }),
                 );
-            }
-            if (mergeSources === 'localFirst') {
-                raw.unshift(content);
-            } else if (mergeSources === 'remoteFirst') {
-                raw.push(content);
-            }
-        } else if (
-            file.source === 'local' &&
-            !['localFirst', 'remoteFirst'].includes(file.mergeSources)
-        ) {
-            raw = file.content;
-        } else {
-            const errors = {};
-            raw = await Promise.all(
-                file.url
-                    .split(/[\r\n]+/)
-                    .map((i) => i.trim())
-                    .filter((i) => i.length)
-                    .map(async (url) => {
-                        try {
-                            return await download(url, ua || file.ua);
-                        } catch (err) {
-                            errors[url] = err;
-                            $.error(
-                                `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
-                            );
-                            return '';
-                        }
-                    }),
-            );
-            let fileIgnoreFailedRemoteFile = file.ignoreFailedRemoteFile;
-            if (
-                ignoreFailedRemoteFile != null &&
-                ignoreFailedRemoteFile !== ''
+                let fileIgnoreFailedRemoteFile = file.ignoreFailedRemoteFile;
+                if (
+                    ignoreFailedRemoteFile != null &&
+                    ignoreFailedRemoteFile !== ''
+                ) {
+                    fileIgnoreFailedRemoteFile = ignoreFailedRemoteFile;
+                }
+                if (
+                    !fileIgnoreFailedRemoteFile &&
+                    Object.keys(errors).length > 0
+                ) {
+                    throw new Error(
+                        `文件 ${file.name} 的远程文件 ${Object.keys(
+                            errors,
+                        ).join(', ')} 发生错误, 请查看日志`,
+                    );
+                }
+                if (mergeSources === 'localFirst') {
+                    raw.unshift(content);
+                } else if (mergeSources === 'remoteFirst') {
+                    raw.push(content);
+                }
+            } else if (
+                file.source === 'local' &&
+                !['localFirst', 'remoteFirst'].includes(file.mergeSources)
             ) {
-                fileIgnoreFailedRemoteFile = ignoreFailedRemoteFile;
-            }
-            if (!fileIgnoreFailedRemoteFile && Object.keys(errors).length > 0) {
-                throw new Error(
-                    `文件 ${file.name} 的远程文件 ${Object.keys(errors).join(
-                        ', ',
-                    )} 发生错误, 请查看日志`,
+                raw = file.content;
+            } else {
+                const errors = {};
+                raw = await Promise.all(
+                    file.url
+                        .split(/[\r\n]+/)
+                        .map((i) => i.trim())
+                        .filter((i) => i.length)
+                        .map(async (url) => {
+                            try {
+                                return await download(
+                                    url,
+                                    ua || file.ua,
+                                    undefined,
+                                    file.proxy || proxy,
+                                    undefined,
+                                    undefined,
+                                    noCache,
+                                );
+                            } catch (err) {
+                                errors[url] = err;
+                                $.error(
+                                    `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
+                                );
+                                return '';
+                            }
+                        }),
                 );
-            }
-            if (file.mergeSources === 'localFirst') {
-                raw.unshift(file.content);
-            } else if (file.mergeSources === 'remoteFirst') {
-                raw.push(file.content);
+                let fileIgnoreFailedRemoteFile = file.ignoreFailedRemoteFile;
+                if (
+                    ignoreFailedRemoteFile != null &&
+                    ignoreFailedRemoteFile !== ''
+                ) {
+                    fileIgnoreFailedRemoteFile = ignoreFailedRemoteFile;
+                }
+                if (
+                    !fileIgnoreFailedRemoteFile &&
+                    Object.keys(errors).length > 0
+                ) {
+                    throw new Error(
+                        `文件 ${file.name} 的远程文件 ${Object.keys(
+                            errors,
+                        ).join(', ')} 发生错误, 请查看日志`,
+                    );
+                }
+                if (file.mergeSources === 'localFirst') {
+                    raw.unshift(file.content);
+                } else if (file.mergeSources === 'remoteFirst') {
+                    raw.push(file.content);
+                }
             }
         }
         const files = (Array.isArray(raw) ? raw : [raw]).flat();
@@ -432,10 +532,15 @@ async function produceArtifact({
         const processed =
             Array.isArray(file.process) && file.process.length > 0
                 ? await ProxyUtils.process(
-                      { $files: files, $content: filesContent },
+                      {
+                          $files: files,
+                          $content: filesContent,
+                          $options,
+                          $file: file,
+                      },
                       file.process,
                   )
-                : { $content: filesContent, $files: files };
+                : { $content: filesContent, $files: files, $options };
 
         return processed?.$content ?? '';
     }
@@ -447,12 +552,64 @@ async function syncArtifacts() {
     const files = {};
 
     try {
+        const valid = [];
         const invalid = [];
+        const allSubs = $.read(SUBS_KEY);
+        const allCols = $.read(COLLECTIONS_KEY);
+        const subNames = [];
+        allArtifacts.map((artifact) => {
+            if (artifact.sync && artifact.source) {
+                if (artifact.type === 'subscription') {
+                    const subName = artifact.source;
+                    const sub = findByName(allSubs, subName);
+                    if (sub && sub.url && !subNames.includes(subName)) {
+                        subNames.push(subName);
+                    }
+                } else if (artifact.type === 'collection') {
+                    const collection = findByName(allCols, artifact.source);
+                    if (collection && Array.isArray(collection.subscriptions)) {
+                        collection.subscriptions.map((subName) => {
+                            const sub = findByName(allSubs, subName);
+                            if (sub && sub.url && !subNames.includes(subName)) {
+                                subNames.push(subName);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        if (subNames.length > 0) {
+            await Promise.all(
+                subNames.map(async (subName) => {
+                    try {
+                        await produceArtifact({
+                            type: 'subscription',
+                            name: subName,
+                            awaitCustomCache: true,
+                        });
+                    } catch (e) {
+                        // $.error(`${e.message ?? e}`);
+                    }
+                }),
+            );
+        }
+
         await Promise.all(
             allArtifacts.map(async (artifact) => {
                 try {
                     if (artifact.sync && artifact.source) {
                         $.info(`正在同步云配置：${artifact.name}...`);
+
+                        const useMihomoExternal =
+                            artifact.platform === 'SurgeMac';
+
+                        if (useMihomoExternal) {
+                            $.info(
+                                `手动指定了 target 为 SurgeMac, 将使用 Mihomo External`,
+                            );
+                        }
+
                         const output = await produceArtifact({
                             type: artifact.type,
                             name: artifact.source,
@@ -460,6 +617,7 @@ async function syncArtifacts() {
                             produceOpts: {
                                 'include-unsupported-proxy':
                                     artifact.includeUnsupportedProxy,
+                                useMihomoExternal,
                             },
                         });
 
@@ -469,27 +627,47 @@ async function syncArtifacts() {
                         files[encodeURIComponent(artifact.name)] = {
                             content: output,
                         };
+
+                        valid.push(artifact.name);
                     }
                 } catch (e) {
                     $.error(
-                        `同步配置 ${artifact.name} 发生错误: ${e.message ?? e}`,
+                        `生成同步配置 ${artifact.name} 发生错误: ${
+                            e.message ?? e
+                        }`,
                     );
                     invalid.push(artifact.name);
                 }
             }),
         );
 
-        if (invalid.length > 0) {
+        $.info(`${valid.length} 个同步配置生成成功: ${valid.join(', ')}`);
+        $.info(`${invalid.length} 个同步配置生成失败: ${invalid.join(', ')}`);
+
+        if (valid.length === 0) {
             throw new Error(
-                `同步配置 ${invalid.join(', ')} 发生错误 详情请查看日志`,
+                `同步配置 ${invalid.join(', ')} 生成失败 详情请查看日志`,
             );
         }
 
         const resp = await syncToGist(files);
         const body = JSON.parse(resp.body);
 
+        delete body.history;
+        delete body.forks;
+        delete body.owner;
+        Object.values(body.files).forEach((file) => {
+            delete file.content;
+        });
+        $.info('上传配置响应:');
+        $.info(JSON.stringify(body, null, 2));
+
         for (const artifact of allArtifacts) {
-            if (artifact.sync) {
+            if (
+                artifact.sync &&
+                artifact.source &&
+                valid.includes(artifact.name)
+            ) {
                 artifact.updated = new Date().getTime();
                 // extract real url from gist
                 let files = body.files;
@@ -500,17 +678,34 @@ async function syncArtifacts() {
                         files.map((item) => [item.path, item]),
                     );
                 }
-                const url = files[encodeURIComponent(artifact.name)]?.raw_url;
-                artifact.url = isGitLab
-                    ? url
-                    : url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+                const raw_url =
+                    files[encodeURIComponent(artifact.name)]?.raw_url;
+                const new_url = isGitLab
+                    ? raw_url
+                    : raw_url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+                $.info(
+                    `上传配置完成\n文件列表: ${Object.keys(files).join(
+                        ', ',
+                    )}\n当前文件: ${encodeURIComponent(
+                        artifact.name,
+                    )}\n响应返回的原始链接: ${raw_url}\n处理完的新链接: ${new_url}`,
+                );
+                artifact.url = new_url;
             }
         }
 
         $.write(allArtifacts, ARTIFACTS_KEY);
-        $.info('全部订阅同步成功！');
+        $.info('上传配置成功');
+
+        if (invalid.length > 0) {
+            throw new Error(
+                `同步配置成功 ${valid.length} 个, 失败 ${invalid.length} 个, 详情请查看日志`,
+            );
+        } else {
+            $.info(`同步配置成功 ${valid.length} 个`);
+        }
     } catch (e) {
-        $.error(`同步订阅失败，原因：${e.message ?? e}`);
+        $.error(`同步配置失败，原因：${e.message ?? e}`);
         throw e;
     }
 }
@@ -520,7 +715,7 @@ async function syncAllArtifacts(_, res) {
         await syncArtifacts();
         success(res);
     } catch (e) {
-        $.error(`同步订阅失败，原因：${e.message ?? e}`);
+        $.error(`同步配置失败，原因：${e.message ?? e}`);
         failed(
             res,
             new InternalServerError(
@@ -566,12 +761,18 @@ async function syncArtifact(req, res) {
     }
 
     try {
+        const useMihomoExternal = artifact.platform === 'SurgeMac';
+
+        if (useMihomoExternal) {
+            $.info(`手动指定了 target 为 SurgeMac, 将使用 Mihomo External`);
+        }
         const output = await produceArtifact({
             type: artifact.type,
             name: artifact.source,
             platform: artifact.platform,
             produceOpts: {
                 'include-unsupported-proxy': artifact.includeUnsupportedProxy,
+                useMihomoExternal,
             },
         });
 
@@ -591,16 +792,34 @@ async function syncArtifact(req, res) {
         });
         artifact.updated = new Date().getTime();
         const body = JSON.parse(resp.body);
+
+        delete body.history;
+        delete body.forks;
+        delete body.owner;
+        Object.values(body.files).forEach((file) => {
+            delete file.content;
+        });
+        $.info('上传配置响应:');
+        $.info(JSON.stringify(body, null, 2));
+
         let files = body.files;
         let isGitLab;
         if (Array.isArray(files)) {
             isGitLab = true;
             files = Object.fromEntries(files.map((item) => [item.path, item]));
         }
-        const url = files[encodeURIComponent(artifact.name)]?.raw_url;
-        artifact.url = isGitLab
-            ? url
-            : url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+        const raw_url = files[encodeURIComponent(artifact.name)]?.raw_url;
+        const new_url = isGitLab
+            ? raw_url
+            : raw_url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+        $.info(
+            `上传配置完成\n文件列表: ${Object.keys(files).join(
+                ', ',
+            )}\n当前文件: ${encodeURIComponent(
+                artifact.name,
+            )}\n响应返回的原始链接: ${raw_url}\n处理完的新链接: ${new_url}`,
+        );
+        artifact.url = new_url;
         $.write(allArtifacts, ARTIFACTS_KEY);
         success(res, artifact);
     } catch (err) {

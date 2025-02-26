@@ -50,11 +50,32 @@ function createCollection(req, res) {
 
 function getCollection(req, res) {
     let { name } = req.params;
+    let { raw } = req.query;
     name = decodeURIComponent(name);
     const allCols = $.read(COLLECTIONS_KEY);
     const collection = findByName(allCols, name);
     if (collection) {
-        success(res, collection);
+        if (raw) {
+            res.set('content-type', 'application/json')
+                .set(
+                    'content-disposition',
+                    `attachment; filename="${encodeURIComponent(
+                        `sub-store_collection_${name}_${new Date()
+                            .toLocaleString('zh-CN', {
+                                year: 'numeric',
+                                day: 'numeric',
+                                month: 'numeric',
+                                hour: 'numeric',
+                                minute: 'numeric',
+                                second: 'numeric',
+                            })
+                            .replace(/\D/g, '')}.json`,
+                    )}"`,
+                )
+                .send(JSON.stringify(collection));
+        } else {
+            success(res, collection);
+        }
     } else {
         failed(
             res,
